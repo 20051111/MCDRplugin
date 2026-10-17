@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-简单放置破坏榜 (SimplePlacedMinedScoreboard) —— 服务端 Sidebar「破坏总和榜 / 放置总和榜」
+简单放置破坏榜 (SimplePlacedMinedScoreboard) —— 服务端 Sidebar 三榜（破坏总和榜 / 放置总和榜 / 总榜）
 
 插件名：简单放置破坏榜 (SimplePlacedMinedScoreboard)
 插件命令：!!spms（旧命令 !!dsb 已不再注册）
@@ -17,25 +17,33 @@
 放置榜 = 玩家各自的 (used.keys() ∩ mined.keys()) 内 used 项计数总和
          并在逐 tick 过程中按 used 的新增数量继续累计
 
+总榜   = 破坏总和 + 放置总和（和两个分榜一致：首次从 JSON 导入初始值，之后每次变化累加增量）
+
+v1.4.0 起三个榜分开显示，自由切换：
+    !!spms break  打开破坏总和榜      !!spms place  打开放置总和榜
+    !!spms total  打开总榜            !!spms hide   统一隐藏
+每个榜的格式统一为：全服总和行 + 排行榜；名字列左对齐，数值走原版分数列右对齐。
+
 渲染方式说明（见 README「侧边栏怎么画的」一节）：
     原版一个 display slot 只能挂一个计分项，team 槽位只是「按队伍颜色区分可见性」，
-    并不是把多个榜单叠起来。所以「同时显示两个榜单」使用一个 dummy 计分项，
-    用假玩家名占行，标题行/数据行都靠 scoreboard players display name 写入文本。
-    名次顺序由分数控制，分数列用 numberformat blank 隐藏（需要 MC 1.20.3+）。
-    在 Minecraft 1.20.4 中由数据包每 tick 汇总增量并用函数宏更新双榜；无需 RCON。
-    stats JSON 仅首次导入历史值，不作为实时数据源。sidebar_layout = "rotate" 可轮播。
+    并不是把多个榜单叠起来。所以每个榜各用一个 dummy 计分项（dsb_rank_brk / dsb_rank_plc /
+    dsb_rank_tot），用假玩家名占行，靠 scoreboard players display name 写入「名次+名字」。
+    数值直接当占位行的分数：原版侧边栏名字列左对齐、分数列右对齐，排序也由分数决定
+    （同分按占位行名字升序，占位行按名次零填充命名，正好维持名次顺序）。
+    在 Minecraft 1.20.4 中由数据包每 tick 汇总增量并用函数宏更新当前榜；无需 RCON。
+    stats JSON 仅首次导入历史值，不作为实时数据源。
 """
 
 PLUGIN_METADATA = {
     # 内部 id 保持不变：改 id 会让 config/数据包索引/计分项槽位全部重来，
     # 世界里的 dsb_* / dsbm* / dsbu* 计分项和历史分数也会变成孤儿。
     'id': 'sidebar_boards',
-    'version': '1.3.0',
+    'version': '1.4.0',
     # MCDR 的插件名只能是单个字符串（description 才支持多语言），所以中英一起写
     'name': '简单放置破坏榜 (SimplePlacedMinedScoreboard)',
     'description': {
-        'en_us': 'Server-tick sidebar boards: total blocks mined / placed, with a total row above each board',
-        'zh_cn': '服务端逐 tick 的破坏总和榜 + 放置总和榜（各自上方一行总破坏 / 总放置）',
+        'en_us': 'Server-tick sidebar boards (break / place / total), switchable via !!spms break|place|total, hide via !!spms hide',
+        'zh_cn': '服务端逐 tick 的破坏总和榜 / 放置总和榜 / 总榜，!!spms break|place|total 切换，!!spms hide 统一隐藏',
     },
     'author': 'TPW',
     'dependencies': {
@@ -68,20 +76,96 @@ MINED_CLASS = 'mined'   # 破坏榜用这个
 USED_CLASS = 'used'     # 放置榜用这个
 
 # 计分项名：<=16 字符，只能 [A-Za-z0-9_.-]
-OBJ_STACKED = 'dsb_rank'    # stacked 布局：一个 dummy 项装两个榜单
-OBJ_BREAK = 'dsb_break'     # rotate 布局：破坏榜
-OBJ_PLACE = 'dsb_place'     # rotate 布局：放置榜
+# 每个玩家的实时总分（dummy，由数据包逐 tick 维护）
+DP_OBJ_BREAK = 'dsb_brk'        # 破坏总和
+DP_OBJ_PLACE = 'dsb_plc'        # 放置总和
+DP_OBJ_TOTAL = 'dsb_tot'        # 总榜 = 破坏 + 放置
+# 全服合计（侧边栏总和行用）
+DP_OBJ_TOTAL_BREAK = 'dsb_tbrk'     # 全服破坏合计
+DP_OBJ_TOTAL_PLACE = 'dsb_tplc'     # 全服放置合计
+DP_OBJ_TOTAL_ALL = 'dsb_ttot'       # 全服总计数（总榜的总和行）
+DP_OBJ_FMT = 'dsb_fmt'              # 千分位格式化用的中间计分项（#fmt / #g1 / #g2 / #g3 / #1000 / #1000000）
+DP_OBJ_BASE = 'dsb_B'  # 旧版名称，仅用于兼容诊断
+DP_INDEX_FILE = 'datapack_index.json'
+DP_SCHEMA = 3
 
-# 侧边栏最多显示 15 行（原版限制）
+# 侧边栏展示计分项（dummy，假玩家占行）：三个榜各一个，用 setdisplay 切换
+DP_BOARD_BREAK = 'dsb_rank_brk'
+DP_BOARD_PLACE = 'dsb_rank_plc'
+DP_BOARD_TOTAL = 'dsb_rank_tot'
+
+# poll 模式的侧边栏展示计分项（只有一个，切换榜单时删旧建新）
+OBJ_BOARD = 'dsb_brd'
+
+# 侧边栏最多显示 15 行（原版限制）；总和行 + 换行按配置占用
 SIDEBAR_RENDER_LIMIT = 15
+# 占位行命名/清理的上限（dsb_*r01 .. dsb_*r15）
+MAX_BOARD_ROWS = SIDEBAR_RENDER_LIMIT
 
-# 假玩家名前缀，用来占行。不能以 '#' 开头（原版规定 '#' 开头的假玩家不显示在侧边栏）
-HOLDER_HEAD_BREAK = 'dsb_h1'
-HOLDER_HEAD_PLACE = 'dsb_h2'
-HOLDER_TOTAL_BREAK = 'dsb_t1'    # 最顶上：总破坏
-HOLDER_TOTAL_PLACE = 'dsb_t2'    # 放置榜上方：总放置
-HOLDER_BREAK_FMT = 'dsb_b{:02d}'
-HOLDER_PLACE_FMT = 'dsb_p{:02d}'
+# 三个榜单的 id（#board dsb_ctl 的取值 = 这里的顺序）
+BOARD_BREAK = 'break'
+BOARD_PLACE = 'place'
+BOARD_TOTAL = 'total'
+
+# 新版本首次需要由插件（控制台）补建的计分项；旧版 stacked 展示项则删除
+DP_NEW_OBJECTIVES = (DP_OBJ_TOTAL, DP_OBJ_TOTAL_ALL, DP_BOARD_BREAK, DP_BOARD_PLACE, DP_BOARD_TOTAL)
+DP_LEGACY_OBJECTIVES = ('dsb_rank',)   # 1.3.x 的 stacked 展示计分项
+DP_OBJECTIVES_MARK = 'dp_objectives_v3.done'
+
+
+def _board_specs() -> List[Dict[str, Any]]:
+    """三个榜单的完整定义。含 cfg() 的字段在调用时求值，配置改动后重新生成即生效。"""
+    return [
+        {'id': BOARD_BREAK, 'index': 0, 'kind': 'b',
+         'objective': DP_OBJ_BREAK, 'total_objective': DP_OBJ_TOTAL_BREAK, 'display': DP_BOARD_BREAK,
+         'title': cfg('break_title'), 'total_label': cfg('total_break_label'), 'prefix': 'dsb_b'},
+        {'id': BOARD_PLACE, 'index': 1, 'kind': 'p',
+         'objective': DP_OBJ_PLACE, 'total_objective': DP_OBJ_TOTAL_PLACE, 'display': DP_BOARD_PLACE,
+         'title': cfg('place_title'), 'total_label': cfg('total_place_label'), 'prefix': 'dsb_p'},
+        {'id': BOARD_TOTAL, 'index': 2, 'kind': 'g',
+         'objective': DP_OBJ_TOTAL, 'total_objective': DP_OBJ_TOTAL_ALL, 'display': DP_BOARD_TOTAL,
+         'title': cfg('total_title'), 'total_label': cfg('total_label'), 'prefix': 'dsb_g'},
+    ]
+
+
+def _board_spec(board_id: str) -> Dict[str, Any]:
+    for spec in _board_specs():
+        if spec['id'] == board_id:
+            return spec
+    return _board_specs()[0]
+
+
+def _active_board() -> str:
+    board = str(cfg('active_board') or BOARD_BREAK).lower()
+    return board if board in (BOARD_BREAK, BOARD_PLACE, BOARD_TOTAL) else BOARD_BREAK
+
+
+def _board_holders(prefix: str, rows: int) -> List[str]:
+    """一个榜的全部假玩家：总和行 / 换行 / 名次行。"""
+    names = [prefix + 't', prefix + 'x']
+    names += [prefix + 'r{:02d}'.format(i) for i in range(1, rows + 1)]
+    return names
+
+
+def _board_extra_rows() -> int:
+    """总和行 + 换行占掉的行数（按当前配置）。"""
+    extra = 0
+    if cfg('show_total_row'):
+        extra += 1
+    if cfg('show_blank_row'):
+        extra += 1
+    return extra
+
+
+def _board_row_budget() -> int:
+    """当前配置下每榜最多能放多少条玩家数据（侧边栏 15 行 - 额外行）。"""
+    return max(1, SIDEBAR_RENDER_LIMIT - _board_extra_rows())
+
+
+def _board_row_limit(player_count: int) -> int:
+    """每榜最多显示的行数：受侧边栏 15 行上限和 board_top_n 限制。"""
+    return max(0, min(int(cfg('board_top_n')), _board_row_budget(), player_count))
+
 
 # 名次颜色，对应参考插件 constants.rankColor = ['§b','§d','§e','§f']
 RANK_COLORS = ['aqua', 'light_purple', 'yellow', 'white']
@@ -113,7 +197,7 @@ CONFIG_DEFAULT: Dict[str, Any] = {
     # poll     : 读 stats/*.json 算总和（延迟 = save_all_interval_seconds）
     # datapack : 服务端数据包逐 tick 统计、排序、显示；不依赖 RCON 或统计文件落盘
     'realtime_mode': 'datapack',
-    'config_version': 2,
+    'config_version': 3,
     'minecraft_version': '1.20.4',
     'datapack_registry_file': '',       # 可选：包含 block/item 的完整注册表，支持模组方块
     'datapack_extra_blocks': [],
@@ -125,18 +209,25 @@ CONFIG_DEFAULT: Dict[str, Any] = {
     'datapack_exclude_items': [],
 
     # ---- 榜单显示 ----
-    'sidebar_layout': 'stacked',     # stacked | rotate
-    'board_top_n': 6,                # 每个榜显示前几名（stacked 下 2 + 2*N 需 <= 15）
-    'rotate_interval_seconds': 10,   # 仅 rotate 布局：两个榜轮播间隔
-    'hide_number_column': True,      # stacked 布局：用 numberformat blank 隐藏分数列（需 1.20.3+）
-    'sidebar_title': '放置/破坏榜',   # 侧边栏最上方的计分项标题（rotate 下是各自标题）
+    # 默认显示哪个榜：break（破坏总和榜）| place（放置总和榜）| total（总榜）
+    # 游戏中用 !!spms break / place / total 随时切换，!!spms hide 统一隐藏
+    'active_board': 'break',
+    # 每个榜显示前几名（配置文件项：board_top_n，改完 !!spms dp rebuild 生效）。
+    # 侧边栏上限 15 行：总和行占 1 行（换行默认关），所以最多 14；
+    # 打开换行自动降为 13，关闭总和行可到 15。默认 10。
+    'board_top_n': 10,
+    'hide_number_column': False,     # 已废弃：数值现在走原版分数列（右对齐），不再隐藏
     'break_title': '破坏总和榜',
     'place_title': '放置总和榜',
+    'total_title': '总榜',
     'show_rank_number': True,        # 行内是否带 #1 #2 名次
-    # 侧边栏「总破坏 / 总放置」两行合计（所有玩家的分数之和），分别排在各自榜单标题上方
+    # 侧边栏顶部的全服总和行（所有玩家的分数之和）
     'show_total_row': True,
+    # 总和行与排行榜之间的换行（空行）；默认关闭，打开就有空行
+    'show_blank_row': False,
     'total_break_label': '总破坏',
     'total_place_label': '总放置',
+    'total_label': '总计数',
     # 所有统计数字的千分位分隔符；留空 = 不加分隔（默认）。
     # 想恢复逗号就填 ","（也支持 " " / "." 之类）
     'thousands_separator': '',
@@ -152,6 +243,8 @@ CONFIG_DEFAULT: Dict[str, Any] = {
 
     # ---- 其他 ----
     'auto_show': True,               # 插件加载后自动开榜
+    # 侧边栏是否显示（启动时的默认状态）；!!spms hide / break|place|total|show 会记住到这里
+    'sidebar_visible': True,
     'refresh_uuid_interval_seconds': 30,   # uuid/玩家名映射的重扫间隔
     # 如果玩家 JSON 里已经有一个“放置总和”字段，优先读它，例如：
     #   "minecraft:custom.minecraft:placed_total"    (点号分隔的 JSON 路径，键本身不含点)
@@ -185,6 +278,12 @@ def load_config(si: PluginServerInterface):
                     _config['config_version'] = 2
                     save_config(si)
                     si.logger.info('[spms] 已迁移旧配置，启用服务端逐 tick 实时模式')
+                if _config['config_version'] < 3:
+                    # 1.4.0：三榜分开显示；旧配置里的 sidebar_layout / sidebar_title 等键已废弃
+                    _config['config_version'] = 3
+                    save_config(si)
+                    si.logger.info('[spms] 已迁移配置到 v3：破坏/放置/总榜分开显示，'
+                                   '用 !!spms break|place|total 切换，!!spms hide 隐藏')
                 return
     except Exception as e:
         si.logger.warning('[spms] 读取配置失败，使用默认值: {}'.format(e))
@@ -213,11 +312,9 @@ _states: Dict[str, 'PlayerState'] = {}   # 玩家名 -> 榜单状态
 _online: Set[str] = set()
 
 _obj_ready = False                    # 计分项是否已建好
-_last_render: Dict[str, Tuple[int, str]] = {}          # stacked: holder -> (score, component_json)
-_last_scores: Dict[str, Dict[str, int]] = {}           # rotate : obj -> {name: value}
-_rotate_current = OBJ_BREAK
-_active_layout = 'stacked'
-_last_rotate_switch = 0.0
+_last_render: Dict[str, Tuple[int, str]] = {}          # poll: holder -> (score, component_json)
+_last_scores: Dict[str, Dict[str, int]] = {}           # poll : obj -> {name: value}（兼容旧字段）
+_active_layout = 'board'              # 1.4.0 起只有「单榜」布局；保留字段兼容旧诊断输出
 _last_save_all = 0.0
 _last_uuid_refresh = 0.0
 _tick_count = 0
@@ -559,14 +656,7 @@ def accumulate_placed(state: 'PlayerState', used: Dict[str, int], mined: Dict[st
 # ===========================================================================
 
 DP_NAME = 'sidebar_boards'
-DP_OBJ_BREAK = 'dsb_brk'
-DP_OBJ_PLACE = 'dsb_plc'
-DP_OBJ_TOTAL_BREAK = 'dsb_tbrk'   # 全服破坏合计（侧边栏最顶那一行用）
-DP_OBJ_TOTAL_PLACE = 'dsb_tplc'   # 全服放置合计
-DP_OBJ_FMT = 'dsb_fmt'            # 千分位格式化用的中间计分项（#fmt / #g1 / #g2 / #g3 / #1000 / #1000000）
-DP_OBJ_BASE = 'dsb_B'  # 旧版名称，仅用于兼容诊断
-DP_INDEX_FILE = 'datapack_index.json'
-DP_SCHEMA = 2
+
 SCORE_MIN = -(2 ** 31)
 SCORE_MAX = 2 ** 31 - 1
 
@@ -713,17 +803,6 @@ def _mc_version_tuple() -> Tuple[int, int, int]:
     if not match:
         raise ValueError('无法识别 Minecraft 版本，请配置 minecraft_version')
     return tuple(int(v or 0) for v in match.groups())
-
-
-def effective_layout() -> str:
-    layout = str(cfg('sidebar_layout')).lower()
-    if _dp_mode() and _mc_version_tuple() < (1, 20, 3):
-        return 'rotate'
-    return 'rotate' if layout == 'rotate' else 'stacked'
-
-
-def rotate_objs() -> Tuple[str, str]:
-    return (DP_OBJ_BREAK, DP_OBJ_PLACE) if _dp_mode() else (OBJ_BREAK, OBJ_PLACE)
 
 
 def dp_root() -> str:
@@ -875,9 +954,18 @@ def dp_write_functions(info_map: Dict[str, Dict[str, Set[str]]], needed: Set[str
     used = sorted(set(mined) & _dp_items)
     used_set = set(used)
     names = sorted(info_map)
+    limit = _board_row_limit(len(names))
+    active = _board_spec(_active_board())
+    specs = _board_specs()
+
+    # ---- load.mcfunction：先建项，再调用 init 做幂等初始化 ----
+    # 兼容说明：目标已存在时「add」会失败并中断本函数（原版函数语义），此时 init 由
+    # tick.mcfunction 的 #ready 门控在 reload 后的下一个 tick 补跑，幂等安全。
     load = []
-    dummy = [DP_OBJ_BREAK, DP_OBJ_PLACE, DP_OBJ_TOTAL_BREAK, DP_OBJ_TOTAL_PLACE, DP_OBJ_FMT,
-             'dsb_init', 'dsb_ctl', 'dsb_work', 'dsb_owner', 'dsb_value']
+    dummy = [DP_OBJ_BREAK, DP_OBJ_PLACE, DP_OBJ_TOTAL,
+             DP_OBJ_TOTAL_BREAK, DP_OBJ_TOTAL_PLACE, DP_OBJ_TOTAL_ALL, DP_OBJ_FMT,
+             'dsb_init', 'dsb_ctl', 'dsb_work', 'dsb_owner', 'dsb_value'] + \
+            [spec['display'] for spec in specs]
     for obj in dummy:
         load.append('scoreboard objectives add {} dummy'.format(obj))
     if _dp_grouping():
@@ -892,9 +980,39 @@ def dp_write_functions(info_map: Dict[str, Dict[str, Set[str]]], needed: Set[str
         slot = dp_slot(item)
         load.append('scoreboard objectives add dsbu{} minecraft.used:{}'.format(slot, item.replace(':', '.')))
         load.append('scoreboard objectives add dsbh{} dummy'.format(slot))
+    load.append('function {}:init'.format(DP_NAME))
 
-    # 准则分数是“新增计数”，游戏 awardStat 会做加法，并非把历史统计绝对赋值。
-    # 只回填汇总值与“曾挖过”标记；不把历史值填进即将再次累计的增量计数器。
+    # ---- init.mcfunction：全部幂等；load 结尾与每次插件 reload 后都会跑到 ----
+    init = []
+    for spec in specs:
+        disp = spec['display']
+        init.append('scoreboard objectives modify {} displayname {}'.format(disp, _title_component(spec['title'])))
+        # 数值走原版分数列（右对齐）；styled 会覆盖旧版遗留的 numberformat blank
+        init.append('scoreboard objectives modify {} numberformat styled {}'.format(
+            disp, _json_component({'color': cfg('value_color')})))
+    # 占位行全部清空（render 会重写当前榜的全部行）
+    for spec in specs:
+        for holder in _board_holders(spec['prefix'], MAX_BOARD_ROWS):
+            init.append('scoreboard players reset {} {}'.format(holder, spec['display']))
+    # 历史导入（dsb_init 守卫：同一 schema 只做一次）
+    for name in names:
+        init.append('execute unless score {} dsb_init matches {} run function {}:{}'.format(
+            name, DP_SCHEMA, DP_NAME, 'seed/' + dp_slug(name)))
+    # 当前显示的榜 / 可见性：已设置过就保留（切换命令写的就是这些分数）
+    init.append('execute unless score #board dsb_ctl matches 0..{} run scoreboard players set #board dsb_ctl {}'.format(
+        len(specs) - 1, active['index']))
+    init.append('execute unless score #visible dsb_ctl matches 0..1 run scoreboard players set #visible dsb_ctl {}'.format(int(_side_visible)))
+    # #enabled 必须无条件置 1：插件卸载时会把它置 0 暂停 tick，
+    # 若沿用 unless 守卫，热重载后会被当成“已设置”而永远停在 0（榜单停止更新）。
+    init.append('scoreboard players set #enabled dsb_ctl 1')
+    # 隐藏状态（sidebar_visible=false 或 !!spms hide）时不画、不占 display slot
+    init.append('execute if score #visible dsb_ctl matches 1 run function {}:render'.format(DP_NAME))
+    init.append('execute if score #visible dsb_ctl matches 1 run scoreboard objectives setdisplay sidebar {}'.format(active['display']))
+    init.append('scoreboard players set #ready dsb_ctl {}'.format(DP_SCHEMA))
+    dp_write_file('init.mcfunction', '\n'.join(init) + '\n')
+
+    # ---- seed：历史导入。准则分数是“新增计数”，游戏 awardStat 会做加法，
+    #      并非把历史统计绝对赋值。只回填汇总值与“曾挖过”标记。 ----
     for name in names:
         state = _states.get(name)
         brk = _dp_score(state.break_total if state else 0)
@@ -902,21 +1020,26 @@ def dp_write_functions(info_map: Dict[str, Dict[str, Set[str]]], needed: Set[str
         # init=1 表示玩家已被原生 tick 捕获、尚未导入历史；保留这段先到的在线增量。
         seed = ['execute unless score {} dsb_init matches 1 run scoreboard players set {} {} 0'.format(name, name, DP_OBJ_BREAK),
                 'execute unless score {} dsb_init matches 1 run scoreboard players set {} {} 0'.format(name, name, DP_OBJ_PLACE),
+                'execute unless score {} dsb_init matches 1 run scoreboard players set {} {} 0'.format(name, name, DP_OBJ_TOTAL),
                 'scoreboard players add {} {} {}'.format(name, DP_OBJ_BREAK, brk),
-                'scoreboard players add {} {} {}'.format(name, DP_OBJ_PLACE, plc)]
+                'scoreboard players add {} {} {}'.format(name, DP_OBJ_PLACE, plc),
+                # 总榜 = 破坏 + 放置（初始值同样来自 JSON）
+                'scoreboard players operation {} {} = {} {}'.format(name, DP_OBJ_TOTAL, name, DP_OBJ_BREAK),
+                'scoreboard players operation {} {} += {} {}'.format(name, DP_OBJ_TOTAL, name, DP_OBJ_PLACE)]
         for item in used:
             if state and state.mined.get(item, 0) > 0:
                 seed.append('scoreboard players set {} dsbh{} 1'.format(name, dp_slot(item)))
         seed.append('scoreboard players set {} dsb_init {}'.format(name, DP_SCHEMA))
-        rel = 'seed/' + dp_slug(name)
-        dp_write_file(rel + '.mcfunction', '\n'.join(seed) + '\n')
-        load.append('execute unless score {} dsb_init matches {} run function {}:{}'.format(name, DP_SCHEMA, DP_NAME, rel))
+        dp_write_file('seed/' + dp_slug(name) + '.mcfunction', '\n'.join(seed) + '\n')
 
     new_player = ['scoreboard players set @s {} 0'.format(DP_OBJ_BREAK),
                   'scoreboard players set @s {} 0'.format(DP_OBJ_PLACE),
+                  'scoreboard players set @s {} 0'.format(DP_OBJ_TOTAL),
                   'scoreboard players set @s dsb_init 1',
                   'scoreboard players set #dirty dsb_ctl 1']
     dp_write_file('new_player.mcfunction', '\n'.join(new_player) + '\n')
+
+    # ---- update：逐 tick 消费准则增量；破坏/放置的每次变化同时累加总榜 ----
     update = ['scoreboard players set #dirty dsb_ctl 0',
               'execute as @a unless score @s dsb_init matches 1..{} run function {}:new_player'.format(DP_SCHEMA, DP_NAME)]
     for cls, items in (('m', mined), ('u', used)):
@@ -926,30 +1049,28 @@ def dp_write_functions(info_map: Dict[str, Dict[str, Set[str]]], needed: Set[str
             rel = 'event/{}{}'.format(cls, slot)
             update.append('execute as @a[scores={{{}=1..}}] run function {}:{}'.format(objective, DP_NAME, rel))
             if cls == 'm':
-                event = ['scoreboard players operation @s {} += @s {}'.format(DP_OBJ_BREAK, objective)]
+                event = ['scoreboard players operation @s {} += @s {}'.format(DP_OBJ_BREAK, objective),
+                         'scoreboard players operation @s {} += @s {}'.format(DP_OBJ_TOTAL, objective)]
                 if item in used_set:
                     event.append('scoreboard players set @s dsbh{} 1'.format(slot))
             else:
                 event = ['execute if score @s dsbh{} matches 1 run scoreboard players operation @s {} += @s {}'.format(
-                    slot, DP_OBJ_PLACE, objective)]
+                    slot, DP_OBJ_PLACE, objective),
+                    'execute if score @s dsbh{} matches 1 run scoreboard players operation @s {} += @s {}'.format(
+                        slot, DP_OBJ_TOTAL, objective)]
             event += ['scoreboard players set @s {} 0'.format(objective), 'scoreboard players set #dirty dsb_ctl 1']
             dp_write_file(rel + '.mcfunction', '\n'.join(event) + '\n')
+    update.append('execute if score #visible dsb_ctl matches 1 if score #dirty dsb_ctl matches 1 run function {}:render'.format(DP_NAME))
 
-    if effective_layout() == 'stacked':
-        update.append('execute if score #visible dsb_ctl matches 1 if score #dirty dsb_ctl matches 1 run function {}:render'.format(DP_NAME))
-        load.extend(_dp_write_render(names))
-    else:
-        dp_write_file('render.mcfunction', '# rotate: 原版计分板自动显示实时数值\n')
-        for obj, title in ((DP_OBJ_BREAK, cfg('break_title')), (DP_OBJ_PLACE, cfg('place_title'))):
-            load.append('scoreboard objectives modify {} displayname {}'.format(obj, _title_component(title)))
-        if _side_visible:
-            load.append('scoreboard objectives setdisplay sidebar {}'.format(DP_OBJ_BREAK))
-    load += ['scoreboard players set #visible dsb_ctl {}'.format(int(_side_visible)),
-             'scoreboard players set #enabled dsb_ctl 1',
-             'scoreboard players set #ready dsb_ctl {}'.format(DP_SCHEMA)]
+    # ---- 三个榜的渲染函数（总和 + 换行 + 排行榜）----
+    _dp_write_boards(names, limit)
+
     dp_write_file('load.mcfunction', '\n'.join(load) + '\n')
     dp_write_file('update.mcfunction', '\n'.join(update) + '\n')
-    dp_write_file('tick.mcfunction', 'execute if score #enabled dsb_ctl matches 1 run function {}:update\n'.format(DP_NAME))
+    # #ready 门控：插件 reload 会把 #ready 清零，reload 后的下一个 tick 重跑一次 init
+    dp_write_file('tick.mcfunction',
+                  'execute unless score #ready dsb_ctl matches {} run function {}:init\n'.format(DP_SCHEMA, DP_NAME) +
+                  'execute if score #enabled dsb_ctl matches 1 run function {}:update\n'.format(DP_NAME))
     for tag in ('load', 'tick'):
         dp_write_tag(tag + '.json', json.dumps({'values': [DP_NAME + ':' + tag]}) + '\n')
 
@@ -1005,109 +1126,98 @@ def _dp_write_number_format():
     dp_write_file('fmt/format.mcfunction', '\n'.join(lines) + '\n')
 
 
-def _dp_write_render(names: List[str]) -> List[str]:
+def _dp_write_boards(names: List[str], limit: int):
+    """
+    生成三个榜的渲染函数与 render 分发。
+
+    每个榜的侧边栏格式（自上而下）：
+        全服总和行（label + 数值） -> 换行（空行） -> 排行榜（#名次 玩家 数值）
+    侧边栏标题 = 该榜计分项的 displayname（破坏总和榜 / 放置总和榜 / 总榜）。
+    render.mcfunction 只渲染 #board 指向的当前榜；切换榜单由插件写 #board + setdisplay。
+    """
+    specs = _board_specs()
     total_on = bool(cfg('show_total_row'))
-    # 侧边栏上限 15 行：合计行各 1 行 + 榜单标题各 1 行 -> 每榜 (15-4)//2 = 5 行
-    rows_budget = SIDEBAR_RENDER_LIMIT - (4 if total_on else 2)
-    limit = min(max(0, int(cfg('board_top_n'))), rows_budget // 2, len(names))
-    head_break_order = 3 + 2 * limit if total_on else 2 * limit + 2
-    head_place_order = 1 + limit if total_on else limit + 1
-    total_break_order = 4 + 2 * limit
-    total_place_order = 2 + limit
-    grouped = bool(_dp_grouping())
+    blank_on = bool(cfg('show_blank_row'))
 
-    def value_lines(source: str, target: str) -> List[str]:
-        """把 source（"Alice dsb_brk" / "#total dsb_tbrk"）写进 storage 路径 target。"""
-        if not grouped:
-            return ['execute store result storage {}:render {} int 1 run scoreboard players get {}'.format(DP_NAME, target, source)]
-        return ['scoreboard players operation #fmt {} = {}'.format(DP_OBJ_FMT, source),
-                'function {}:fmt/format'.format(DP_NAME),
-                'data modify storage {}:render {} set from storage {}:fmt out'.format(DP_NAME, target, DP_NAME)]
+    # render.mcfunction：按 #board 分发到当前榜
+    dispatch = ['execute if score #board dsb_ctl matches {} run function {}:render/{}'.format(
+        spec['index'], DP_NAME, spec['kind']) for spec in specs]
+    dp_write_file('render.mcfunction', '\n'.join(dispatch) + '\n')
 
-    load = ['scoreboard objectives add {} dummy {}'.format(OBJ_STACKED, _title_component(cfg('sidebar_title'))),
-            'scoreboard objectives modify {} displayname {}'.format(OBJ_STACKED, _title_component(cfg('sidebar_title')))]
-    if cfg('hide_number_column'):
-        load.append('scoreboard objectives modify {} numberformat blank'.format(OBJ_STACKED))
-    all_holders = [HOLDER_HEAD_BREAK, HOLDER_HEAD_PLACE, HOLDER_TOTAL_BREAK, HOLDER_TOTAL_PLACE] + \
-                  [fmt.format(i) for fmt in (HOLDER_BREAK_FMT, HOLDER_PLACE_FMT) for i in range(1, 8)]
-    for holder in all_holders:
-        load += ['scoreboard players reset {} {}'.format(holder, OBJ_STACKED),
-                 'scoreboard players reset {} dsb_owner'.format(holder),
-                 'scoreboard players reset {} dsb_value'.format(holder)]
-    for holder, order, title in ((HOLDER_HEAD_BREAK, head_break_order, cfg('break_title')),
-                                  (HOLDER_HEAD_PLACE, head_place_order, cfg('place_title'))):
-        load += ['scoreboard players set {} {} {}'.format(holder, OBJ_STACKED, order),
-                 'scoreboard players display name {} {} {}'.format(holder, OBJ_STACKED, _title_component(title))]
-    # 布局（自上而下）：总破坏 / 破坏榜（标题+行） / 总放置 / 放置榜（标题+行）
-    totals = ((HOLDER_TOTAL_BREAK, total_break_order, cfg('total_break_label'), DP_OBJ_TOTAL_BREAK, 'break'),
-              (HOLDER_TOTAL_PLACE, total_place_order, cfg('total_place_label'), DP_OBJ_TOTAL_PLACE, 'place'))
-    if total_on:
-        for holder, order, label, _obj, _suffix in totals:
-            load += ['scoreboard players set {} {} {}'.format(holder, OBJ_STACKED, order),
-                     'scoreboard players display name {} {} {}'.format(holder, OBJ_STACKED, _json_component({'text': '', 'extra': [
-                         {'text': str(label) + ' ', 'color': cfg('title_color')},
-                         {'text': '0', 'color': cfg('value_color')}]}))]
-    render = []
-    if total_on:
-        # 全服合计 = 所有候选玩家 dsb_brk / dsb_plc 之和，每次重画时重新算
-        render.append('scoreboard players set #total {} 0'.format(DP_OBJ_TOTAL_BREAK))
-        render.append('scoreboard players set #total {} 0'.format(DP_OBJ_TOTAL_PLACE))
-        for name in names:
-            render.append('scoreboard players operation #total {} += {} {}'.format(DP_OBJ_TOTAL_BREAK, name, DP_OBJ_BREAK))
-            render.append('scoreboard players operation #total {} += {} {}'.format(DP_OBJ_TOTAL_PLACE, name, DP_OBJ_PLACE))
-    for kind, objective, holder_fmt in (('b', DP_OBJ_BREAK, HOLDER_BREAK_FMT), ('p', DP_OBJ_PLACE, HOLDER_PLACE_FMT)):
+    for spec in specs:
+        kind = spec['kind']
+        objective = spec['objective']
+        total_obj = spec['total_objective']
+        disp = spec['display']
+        prefix = spec['prefix']
+        total_holder = prefix + 't'
+        blank_holder = prefix + 'x'
+        render = []
+        # 先清空本榜全部占位行，再把当前前 N 名写回去（玩家变少时不会留旧行）
+        for holder in _board_holders(prefix, limit):
+            render.append('scoreboard players reset {} {}'.format(holder, disp))
+        if total_on:
+            # 全服合计 = 所有候选玩家分数之和，每次重画时重新算
+            render.append('scoreboard players set #total {} 0'.format(total_obj))
+            for name in names:
+                render.append('scoreboard players operation #total {} += {} {}'.format(total_obj, name, objective))
+        # 排名：把每个玩家的分数复制到 dsb_work，再逐名次取最大
         for name in names:
             render.append('scoreboard players operation {} dsb_work = {} {}'.format(name, name, objective))
         for rank in range(1, limit + 1):
-            holder = holder_fmt.format(rank)
+            holder = prefix + 'r{:02d}'.format(rank)
             render.append('scoreboard players set #best dsb_work {}'.format(SCORE_MIN))
             for name in names:
                 render.append('scoreboard players operation #best dsb_work > {} dsb_work'.format(name))
             render.append('scoreboard players set #picked dsb_ctl 0')
-            # 按名字升序挑选并列第一，榜外玩家和离线玩家都参与，不截断候选集合。
+            # #best 沉底（<= SCORE_MIN）说明没有更多可选玩家，该名次留空
             for player_id, name in enumerate(names, 1):
                 rel = 'render/{}_{}_{}'.format(kind, rank, dp_slug(name))
-                render.append('execute if score #picked dsb_ctl matches 0 if score {} dsb_work = #best dsb_work run function {}:{}'.format(name, DP_NAME, rel))
-                write_rel = rel + '_write'
+                render.append('execute if score #best dsb_work matches {}.. if score #picked dsb_ctl matches 0 '
+                              'if score {} dsb_work = #best dsb_work run function {}:{}'.format(
+                                  SCORE_MIN + 1, name, DP_NAME, rel))
                 chosen = ['scoreboard players set #picked dsb_ctl 1',
                           'scoreboard players set {} dsb_work {}'.format(name, SCORE_MIN),
-                          'execute unless score {} dsb_owner matches {} run function {}:{}'.format(holder, player_id, DP_NAME, write_rel),
-                          'execute unless score {} dsb_value = {} {} run function {}:{}'.format(holder, name, objective, DP_NAME, write_rel)]
+                          # 数值写进占位行的【分数】：原版侧边栏名字列左对齐、分数列右对齐，
+                          # 同分时按占位行名字（dsb_*r01..r13 零填充）升序，正好维持名次顺序。
+                          'scoreboard players operation {} {} = {} {}'.format(holder, disp, name, objective),
+                          # ⚠ ensure_ascii=False：Brigadier 的 NBT 字符串不接受 \uXXXX 转义，
+                          #   JSON 组件（display name）才接受。玩家名虽是 ASCII，统一按字面输出。
+                          'data modify storage {}:render row set value {}'.format(
+                              DP_NAME, json.dumps({'name': name}, ensure_ascii=False, separators=(',', ':')))]
+                chosen += ['function {}:render/row_{}{} with storage {}:render row'.format(DP_NAME, kind, rank, DP_NAME),
+                           'scoreboard players set {} dsb_owner {}'.format(holder, player_id),
+                           'scoreboard players operation {} dsb_value = {} {}'.format(holder, name, objective)]
                 dp_write_file(rel + '.mcfunction', '\n'.join(chosen) + '\n')
-                write = ['data modify storage {}:render row set value {}'.format(DP_NAME, json.dumps({'name': name}, separators=(',', ':')))]
-                write += value_lines('{} {}'.format(name, objective), 'row.value')
-                write += ['function {}:render/row_{}{} with storage {}:render row'.format(DP_NAME, kind, rank, DP_NAME),
-                          'scoreboard players set {} dsb_owner {}'.format(holder, player_id),
-                          'scoreboard players operation {} dsb_value = {} {}'.format(holder, name, objective)]
-                dp_write_file(write_rel + '.mcfunction', '\n'.join(write) + '\n')
-            # 1.20.4 函数宏把数值写成实际文本，避免未解析的 score 组件在侧边栏显示为空。
+            # 显示名只放「名次 + 名字」（左对齐列）；数值在右侧分数列
             extra = []
             if cfg('show_rank_number'):
                 extra.append({'text': '#{} '.format(rank), 'color': RANK_COLORS[min(rank - 1, len(RANK_COLORS) - 1)]})
-            extra += [{'text': '$(name) ', 'color': cfg('name_color')},
-                      {'text': '$(value)', 'color': cfg('value_color')}]
-            order = head_break_order - rank if kind == 'b' else head_place_order - rank
-            row = ['scoreboard players set {} {} {}'.format(holder, OBJ_STACKED, order),
-                   '$scoreboard players display name {} {} {}'.format(holder, OBJ_STACKED, _json_component({'text': '', 'extra': extra}))]
+            extra += [{'text': '$(name)', 'color': cfg('name_color')}]
+            row = ['$scoreboard players display name {} {} {}'.format(holder, disp, _json_component({'text': '', 'extra': extra}))]
             dp_write_file('render/row_{}{}.mcfunction'.format(kind, rank), '\n'.join(row) + '\n')
-    if total_on:
-        # 两个合计行各自显示自己的数字；只在合计真的变了才重写这一行
-        for holder, order, label, objective, suffix in totals:
-            render.append('execute unless score {} dsb_value = #total {} run function {}:render/total_{}_write'.format(
-                holder, objective, DP_NAME, suffix))
-            write = value_lines('#total {}'.format(objective), 'total.value')
-            write += ['function {}:render/row_total_{} with storage {}:render total'.format(DP_NAME, suffix, DP_NAME),
-                      'scoreboard players operation {} dsb_value = #total {}'.format(holder, objective)]
-            dp_write_file('render/total_{}_write.mcfunction'.format(suffix), '\n'.join(write) + '\n')
-            row = ['scoreboard players set {} {} {}'.format(holder, OBJ_STACKED, order),
-                   '$scoreboard players display name {} {} {}'.format(holder, OBJ_STACKED, _json_component({'text': '', 'extra': [
-                       {'text': str(label) + ' ', 'color': cfg('title_color')},
-                       {'text': '$(value)', 'color': cfg('value_color')}]}))]
-            dp_write_file('render/row_total_{}.mcfunction'.format(suffix), '\n'.join(row) + '\n')
-    dp_write_file('render.mcfunction', '\n'.join(render) + '\n')
-    if _side_visible:
-        load += ['function {}:render'.format(DP_NAME), 'scoreboard objectives setdisplay sidebar {}'.format(OBJ_STACKED)]
-    return load
+        if total_on:
+            # 总和行：名字列放 label（左对齐），分数列放全服合计（右对齐）
+            render.append('scoreboard players operation {} {} = #total {}'.format(total_holder, disp, total_obj))
+            # 注意：没有宏变量就不要加 $ 前缀，否则函数加载报 "Macro without variables"
+            render.append('scoreboard players display name {} {} {}'.format(
+                total_holder, disp, _json_component({'text': str(spec['total_label']), 'color': cfg('title_color')})))
+            render.append('scoreboard players operation {} dsb_value = #total {}'.format(total_holder, total_obj))
+        if blank_on:
+            # 换行：总和行与排行榜之间的空行。
+            # 分数列即数值，空行没有数值——取「第一名分数+1」排在总和行与第一名之间；
+            # 没有玩家入选时 guard 不成立，空行随开头的 reset 一起清掉（不显示）。
+            rank1_holder = prefix + 'r01'
+            blank_row = [
+                'execute if score {} {} matches {}.. run scoreboard players operation {} {} = {} {}'.format(
+                    rank1_holder, disp, SCORE_MIN + 1, blank_holder, disp, rank1_holder, disp),
+                'execute if score {} {} matches {}.. run scoreboard players add {} {} 1'.format(
+                    rank1_holder, disp, SCORE_MIN + 1, blank_holder, disp),
+                'scoreboard players display name {} {} {}'.format(blank_holder, disp, _json_component({'text': ''})),
+            ]
+            dp_write_file('render/blank_{}.mcfunction'.format(kind), '\n'.join(blank_row) + '\n')
+            render.append('function {}:render/blank_{}'.format(DP_NAME, kind))
+        dp_write_file('render/{}.mcfunction'.format(kind), '\n'.join(render) + '\n')
 
 
 def dp_save_all_sync():
@@ -1125,6 +1235,34 @@ def dp_save_all_sync():
             raise RuntimeError('插件已卸载，取消首次迁移')
         if time.monotonic() >= deadline:
             raise RuntimeError('首次迁移等待 Saved the game 超时；请检查存档日志并运行 !!spms dp rebuild')
+
+
+def _dp_migrate_objectives():
+    """
+    1.3.x -> 1.4.0 记分项迁移（只做一次）：
+      - 补建总榜/三个展示计分项（dsb_tot / dsb_ttot / dsb_rank_*）
+      - 删除废弃的 stacked 展示计分项 dsb_rank
+    控制台指令失败（已存在/不存在）只是在控制台留一行错误，无害；
+    之后 reload 时数据包 load 会自行建齐其余计分项。
+    """
+    if server is None:
+        return
+    mark = data_file(DP_OBJECTIVES_MARK)
+    if os.path.isfile(mark):
+        return
+    if not _server_ready():
+        return  # 服务端没就绪，指令会被丢掉；下次 dp_setup 再试
+    try:
+        for obj in DP_LEGACY_OBJECTIVES:
+            server.execute('scoreboard objectives remove {}'.format(obj))
+        for obj in DP_NEW_OBJECTIVES:
+            server.execute('scoreboard objectives add {} dummy'.format(obj))
+        _ensure_parent_dir(mark)
+        with open(mark, 'w', encoding='utf-8') as f:
+            f.write('ok\n')
+        server.logger.info('[spms] 已补建 1.4.0 新记分项（总榜 + 三榜展示项），并移除废弃的 dsb_rank')
+    except Exception as e:
+        server.logger.debug('[spms] 迁移记分项失败（reload 后会由数据包 load 重建）: {}'.format(e))
 
 
 def dp_setup(force_reseed: bool = False):
@@ -1153,6 +1291,14 @@ def dp_setup(force_reseed: bool = False):
         dp_save_index()
         _dp_seeded = True
         _dp_existing_runtime = True
+        # 迁移 + 让数据包在 reload 后的下一个 tick 重跑一次幂等 init
+        _dp_migrate_objectives()
+        try:
+            server.execute('scoreboard players set #ready dsb_ctl 0')
+            server.execute('scoreboard players set #board dsb_ctl {}'.format(_board_spec(_active_board())['index']))
+            server.execute('scoreboard players set #visible dsb_ctl {}'.format(int(bool(cfg('sidebar_visible')))))
+        except Exception as e:
+            server.logger.debug('[spms] 预置记分失败（init 会补上）: {}'.format(e))
         server.execute('reload')
         server.logger.info('[spms] 已生成实时数据包并请求 reload：{} 名玩家、{} 种方块；统计和显示由服务端逐 tick 执行，无需 RCON'.format(len(info), len(_dp_blocks)))
 
@@ -1191,11 +1337,11 @@ def dp_read_totals() -> int:
 def dp_diagnose() -> List[str]:
     return ['§6======== 简单放置破坏榜 数据包 ========',
             '§7Minecraft: §f{}   §7pack_format: §f{}'.format(_server_mc_version(), dp_pack_format()),
-            '§7布局: §f{}   §7数据包: §f{}'.format(effective_layout(), dp_root()),
+            '§7当前榜单: §f{}   §7数据包: §f{}'.format(_board_spec(_active_board())['title'], dp_root()),
             '§7统计/排名/显示: §a服务端逐 tick；无需 RCON、无需周期存档',
             '§7注册方块: §f{}   §7used 准则: §f{}   §7排名玩家: §f{}'.format(len(_dp_created_m), len(_dp_created_u), len(_dp_players)),
             '§7最近错误: §f{}'.format(_dp_last_error or '(无)'),
-            '§7可用 /datapack list 核对加载，用 /scoreboard players get #ready dsb_ctl 核对值为 2',
+            '§7可用 /datapack list 核对加载，用 /scoreboard players get #ready dsb_ctl 核对值为 {}'.format(DP_SCHEMA),
             '§8新增方块模组请提供完整 datapack_registry_file，或填写 extra_blocks / extra_items。']
 
 
@@ -1319,26 +1465,39 @@ def sync_player_states(initial: bool = False) -> bool:
 # 榜单排序
 # ===========================================================================
 
-def board_rows(limit: Optional[int] = None) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
-    """返回 (破坏榜, 放置榜)，均按数值降序，同分按玩家名升序"""
+def board_full() -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """返回 (破坏榜, 放置榜, 总榜) 的完整排序（降序，同分按玩家名升序），不截断。"""
     with _lock:
         states = list(_states.values())
     brk = [(s.name, s.break_total) for s in states]
     plc = [(s.name, s.placed) for s in states]
-    brk.sort(key=lambda x: (-x[1], x[0]))
-    plc.sort(key=lambda x: (-x[1], x[0]))
+    tot = [(s.name, s.break_total + s.placed) for s in states]
+    for lst in (brk, plc, tot):
+        lst.sort(key=lambda x: (-x[1], x[0]))
+    return brk, plc, tot
+
+
+def board_rows(limit: Optional[int] = None) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """返回 (破坏榜, 放置榜) 前 N 行"""
+    brk, plc, _tot = board_full()
     top_n = max(0, int(cfg('board_top_n'))) if limit is None else max(0, int(limit))
     return brk[:top_n], plc[:top_n]
+
+
+def _board_rows_for(board_id: str) -> List[Tuple[str, int]]:
+    brk, plc, tot = board_full()
+    return {BOARD_BREAK: brk, BOARD_PLACE: plc, BOARD_TOTAL: tot}[board_id]
 
 
 # ===========================================================================
 # 侧边栏渲染
 #
 # 关键点：原版一个 display slot 只能挂一个计分项（sidebar.team.<color> 只是按队伍颜色
-# 控制可见性，不会把多个榜单堆起来）。所以「同时显示两个总和榜」用一个 dummy 计分项：
-#   假玩家名占行 -> scoreboard players set 控制排序
-#                -> scoreboard players display name 写入这一行显示的文本
-#                -> scoreboard objectives modify <obj> numberformat blank 隐藏分数列
+# 控制可见性，不会把多个榜单堆起来）。所以每个榜各用一个 dummy 计分项，切换榜单就是
+# setdisplay 到对应计分项：
+#   假玩家名占行 -> scoreboard players display name 写入「名次 + 名字」（左对齐列）
+#                -> 占位行的分数 = 该行数值：原版分数列右对齐，排序也按分数来
+# 每个榜的视觉顺序：全服总和行 -> 换行 -> 排行榜。
 # ===========================================================================
 
 def _json_component(obj: Dict[str, Any]) -> str:
@@ -1354,14 +1513,17 @@ def _title_component(title: str) -> str:
     return _json_component({'text': str(title), 'color': cfg('title_color'), 'bold': True})
 
 
-def _row_component(rank: Optional[int], name: str, value: int) -> str:
-    """名次 + 玩家名 + 数值（数值直接写进行文本里，因为分数列是隐藏的）"""
+def _row_component(rank: Optional[int], name: str) -> str:
+    """名次 + 玩家名（数值在右侧分数列，这里不放）"""
     extra: List[Dict[str, Any]] = []
     if rank is not None and cfg('show_rank_number'):
         extra.append({'text': '#{} '.format(rank), 'color': RANK_COLORS[min(rank - 1, len(RANK_COLORS) - 1)]})
-    extra.append({'text': str(name) + ' ', 'color': cfg('name_color')})
-    extra.append({'text': str(value), 'color': cfg('value_color')})
+    extra.append({'text': str(name), 'color': cfg('name_color')})
     return _json_component({'text': '', 'extra': extra})
+
+
+def _total_row_component(label: str) -> str:
+    return _json_component({'text': str(label), 'color': cfg('title_color')})
 
 
 def _remove_objectives(objs: List[str]):
@@ -1378,65 +1540,58 @@ def _clear_render_cache():
 
 
 def setup_objectives():
-    """建计分项。切换布局时要把另一种布局的计分项删掉，避免残留。"""
-    global _obj_ready, _rotate_current, _active_layout
-    layout = effective_layout()
-    _active_layout = layout
-
+    """建 poll 模式的展示计分项（数据包模式由 load/init 负责建项与显示）。"""
+    global _obj_ready
     if _dp_mode():
         # 数据包 load 函数负责建项与显示，不能在异步 reload 后又删除它们。
-        _rotate_current = rotate_objs()[0]
-        _last_rotate_switch_force()
         _obj_ready = True
         return
-
-    if layout == 'rotate':
-        _remove_objectives([OBJ_STACKED, OBJ_BREAK, OBJ_PLACE])
-        server.execute('scoreboard objectives add {} dummy {}'.format(OBJ_BREAK, _title_component(cfg('break_title'))))
-        server.execute('scoreboard objectives add {} dummy {}'.format(OBJ_PLACE, _title_component(cfg('place_title'))))
-        _rotate_current = OBJ_BREAK
-        _last_rotate_switch_force()
-    else:
-        _remove_objectives([OBJ_BREAK, OBJ_PLACE, OBJ_STACKED])
-        server.execute('scoreboard objectives add {} dummy {}'.format(OBJ_STACKED, _title_component(cfg('sidebar_title'))))
-        if cfg('hide_number_column'):
-            # 隐藏分数列（1.20.3+）。否则名次排序用的分数会显示出来。
-            server.execute('scoreboard objectives modify {} numberformat blank'.format(OBJ_STACKED))
-
+    spec = _board_spec(_active_board())
+    # 切换榜单时删旧建新：顺带清掉另一个榜残留的占位行
+    _remove_objectives([OBJ_BOARD])
+    server.execute('scoreboard objectives add {} dummy {}'.format(OBJ_BOARD, _title_component(spec['title'])))
+    # 数值走原版分数列（右对齐），用 value_color 上色
+    server.execute('scoreboard objectives modify {} numberformat styled {}'.format(
+        OBJ_BOARD, _json_component({'color': cfg('value_color')})))
     _obj_ready = True
     if _side_visible:
         show_sidebar()
 
 
-def _last_rotate_switch_force():
-    global _last_rotate_switch
-    _last_rotate_switch = time.monotonic()
+def _set_visible(visible: bool):
+    """记住侧边栏可见性到配置（启动时按它决定显示与否）。"""
+    global _side_visible
+    _side_visible = visible
+    _config['sidebar_visible'] = bool(visible)
+    try:
+        save_config(server)
+    except Exception:
+        pass
 
 
 def show_sidebar():
     global _side_visible
     _side_visible = True
+    _config['sidebar_visible'] = True
     if not _obj_ready:
         return
     if _dp_mode():
         server.execute('scoreboard players set #visible dsb_ctl 1')
+    server.execute('scoreboard objectives setdisplay sidebar {}'.format(_board_spec(_active_board())['display'] if _dp_mode() else OBJ_BOARD))
+    if _dp_mode():
         server.execute('function {}:render'.format(DP_NAME))
-    if effective_layout() == 'rotate':
-        server.execute('scoreboard objectives setdisplay sidebar {}'.format(_rotate_current))
-    else:
-        server.execute('scoreboard objectives setdisplay sidebar {}'.format(OBJ_STACKED))
 
 
 def hide_sidebar():
     global _side_visible
-    _side_visible = False
+    _set_visible(False)
     if _dp_mode():
         server.execute('scoreboard players set #visible dsb_ctl 0')
     server.execute('scoreboard objectives setdisplay sidebar')
 
 
 def render(force: bool = False):
-    """按当前布局渲染；只有真正变化的行才发指令（防止刷屏 / 无谓的指令洪流）"""
+    """渲染当前榜；数据包模式下由服务端逐 tick 自己画，插件只在 force 时触发。"""
     global _stat_renders
     if server is None or not _obj_ready:
         return
@@ -1446,25 +1601,28 @@ def render(force: bool = False):
         if force:
             server.execute('function {}:render'.format(DP_NAME))
         return
-    if effective_layout() == 'rotate':
-        render_rotate(force=force)
-    else:
-        render_stacked(force=force)
+    render_board(force=force)
     _stat_renders += 1
 
 
-def render_stacked(force: bool = False):
+def render_board(force: bool = False):
+    """poll 模式：把当前榜（总和 + 换行 + 排行榜）画到侧边栏。"""
     global _last_render
-    brk, plc = board_rows()
+    spec = _board_spec(_active_board())
+    prefix = spec['prefix']
+    rows = _board_rows_for(spec['id'])
+    top_n = max(0, min(int(cfg('board_top_n')), _board_row_budget()))
+    rows = rows[:top_n]
 
-    # 视觉顺序：破坏榜标题 -> 破坏榜数据行 -> 放置榜标题 -> 放置榜数据行
+    # 视觉顺序：总和行 -> 换行 -> 排行榜；分数 = 数值本身（原版分数列右对齐）
     desired: List[Tuple[str, int, str]] = []          # (holder, score, component)
-    desired.append((HOLDER_HEAD_BREAK, 0, _title_component(cfg('break_title'))))
-    for i, (name, value) in enumerate(brk):
-        desired.append((HOLDER_BREAK_FMT.format(i + 1), 0, _row_component(i + 1, name, value)))
-    desired.append((HOLDER_HEAD_PLACE, 0, _title_component(cfg('place_title'))))
-    for i, (name, value) in enumerate(plc):
-        desired.append((HOLDER_PLACE_FMT.format(i + 1), 0, _row_component(i + 1, name, value)))
+    if cfg('show_total_row'):
+        total_value = sum(v for _, v in _board_rows_for(spec['id']))
+        desired.append((prefix + 't', total_value, _total_row_component(spec['total_label'])))
+    if cfg('show_blank_row'):
+        desired.append((prefix + 'x', 0, _json_component({'text': ''})))
+    for i, (name, value) in enumerate(rows):
+        desired.append((prefix + 'r{:02d}'.format(i + 1), value, _row_component(i + 1, name)))
 
     # 分数只用来自定义排序：视觉第 1 行分数最高，依次递减
     total = len(desired)
@@ -1481,66 +1639,17 @@ def render_stacked(force: bool = False):
     to_write.sort(key=lambda h: -plan[h][0])
 
     for holder in to_remove:
-        server.execute('scoreboard players reset {} {}'.format(holder, OBJ_STACKED))
+        server.execute('scoreboard players reset {} {}'.format(holder, OBJ_BOARD))
     for holder in to_write:
         score, component = plan[holder]
-        server.execute('scoreboard players set {} {} {}'.format(holder, OBJ_STACKED, score))
-        server.execute('scoreboard players display name {} {} {}'.format(holder, OBJ_STACKED, component))
+        server.execute('scoreboard players set {} {} {}'.format(holder, OBJ_BOARD, score))
+        server.execute('scoreboard players display name {} {} {}'.format(holder, OBJ_BOARD, component))
 
     with _lock:
         _last_render = plan
 
     if to_remove or to_write:
-        _log('渲染 stacked：写 {} 行，清 {} 行（破坏榜 {} 人 / 放置榜 {} 人）'.format(
-            len(to_write), len(to_remove), len(brk), len(plc)))
-
-
-def render_rotate(force: bool = False):
-    """两个真实计分项，用真实玩家名，分数列直接显示数值；按 rotate_interval_seconds 轮播"""
-    global _last_scores
-    if _dp_mode():
-        # 数据包模式：dsb_brk / dsb_plc 的分数由服务端每 tick 自己维护，插件不写分数
-        return
-    obj_break, obj_place = rotate_objs()
-    # rotate 下不需要排序分数，直接用原版“取分数最高的 15 个”的行为
-    brk, plc = board_rows(limit=SIDEBAR_RENDER_LIMIT)
-    all_rows = {}
-    for name, value in brk:
-        all_rows.setdefault(name, {})[obj_break] = value
-    for name, value in plc:
-        all_rows.setdefault(name, {})[obj_place] = value
-
-    with _lock:
-        previous = {obj: dict(m) for obj, m in _last_scores.items()}
-
-    for obj in (obj_break, obj_place):
-        prev = previous.get(obj, {})
-        for name, per_obj in all_rows.items():
-            value = per_obj.get(obj)
-            if value is None:
-                continue
-            if force or prev.get(name) != value:
-                server.execute('scoreboard players set {} {} {}'.format(name, obj, value))
-
-    with _lock:
-        _last_scores = {obj_break: {}, obj_place: {}}
-        for name, per_obj in all_rows.items():
-            for obj, value in per_obj.items():
-                _last_scores[obj][name] = value
-
-
-def rotate_tick():
-    """rotate 布局的轮播"""
-    global _rotate_current
-    if not _side_visible or not _obj_ready:
-        return
-    interval = max(1.0, float(cfg('rotate_interval_seconds')))
-    if time.monotonic() - _last_rotate_switch < interval:
-        return
-    _last_rotate_switch_force()
-    obj_break, obj_place = rotate_objs()
-    _rotate_current = obj_place if _rotate_current == obj_break else obj_break
-    server.execute('scoreboard objectives setdisplay sidebar {}'.format(_rotate_current))
+        _log('渲染 {}：写 {} 行，清 {} 行'.format(spec['id'], len(to_write), len(to_remove)))
 
 
 # ===========================================================================
@@ -1620,8 +1729,6 @@ def _tick_once_locked(force: bool = False) -> bool:
         changed = _dp_tick(False)
         if force:
             render(force=True)
-        if effective_layout() == 'rotate':
-            rotate_tick()
         return changed
 
     maybe_save_all()
@@ -1636,9 +1743,6 @@ def _tick_once_locked(force: bool = False) -> bool:
 
     if force or changed or not _rendered_once:
         render(force=force and not _rendered_once)
-
-    if effective_layout() == 'rotate':
-        rotate_tick()
     return changed
 
 
@@ -1690,7 +1794,7 @@ def _ensure_tick_thread():
 def start_boards():
     """初始化：从服务端玩家数据 JSON 读历史累计值（不从 0 开始），然后建项、渲染"""
     global _rendered_once, _last_save_all, _side_visible, _tick_count
-    _side_visible = True
+    _side_visible = bool(cfg('sidebar_visible'))
     _clear_render_cache()
     with _lock:
         _states.clear()
@@ -1712,14 +1816,13 @@ def start_boards():
     _rendered_once = True
 
     top_n = max(0, int(cfg('board_top_n')))
-    if effective_layout() != 'rotate':
-        if 2 + 2 * top_n > SIDEBAR_RENDER_LIMIT:
-            server.logger.warning(
-                '[spms] board_top_n={} 会产生 {} 行，超过侧边栏 {} 行的上限，'
-                '已将实时双榜限制到每榜最多 {} 行。'.format(
-                    top_n, 2 + 2 * top_n, SIDEBAR_RENDER_LIMIT, (SIDEBAR_RENDER_LIMIT - 2) // 2))
-    server.logger.info('[spms] 已启动：模式 {}，布局 {}；统计目录 {}；识别玩家 {} 名（已排除 bot_ 前缀）'.format(
-        cfg('realtime_mode'), effective_layout(), stats_dir(), len(known_players())))
+    budget = _board_row_budget()
+    if top_n > budget:
+        server.logger.warning(
+            '[spms] board_top_n={} 超过当前配置下的行数上限（侧边栏 15 行 - 总和/换行 = {} 行），已按 {} 行显示。'.format(
+                top_n, budget, budget))
+    server.logger.info('[spms] 已启动：模式 {}，当前榜 {}；统计目录 {}；识别玩家 {} 名（已排除 bot_ 前缀）'.format(
+        cfg('realtime_mode'), _board_spec(_active_board())['title'], stats_dir(), len(known_players())))
 
 
 def stop_boards():
@@ -1761,21 +1864,22 @@ def _print_status(src: CommandSource):
         if not dp_can_read():
             _reply(src, '§7实时排名见侧边栏；未开启 RCON 时不把本地历史快照当作实时值显示。')
             return
-        brk, plc = board_rows()
-        for title, rows in ((cfg('break_title'), brk), (cfg('place_title'), plc)):
-            _reply(src, '§6---- {} ----'.format(title))
-            for line in _status_rows(rows):
+        brk, plc, tot = board_full()
+        for spec in _board_specs():
+            rows = {BOARD_BREAK: brk, BOARD_PLACE: plc, BOARD_TOTAL: tot}[spec['id']]
+            _reply(src, '§6---- {} ----'.format(spec['title']))
+            for line in _status_rows(rows[:max(0, int(cfg('board_top_n')))]):
                 _reply(src, line)
         return
-    brk, plc = board_rows()
+    brk, plc, tot = board_full()
     with _lock:
         n_states = len(_states)
         n_online = len(_online)
         n_uuid = len(uuid_list)
     lines = [
         '§6======== 简单放置破坏榜 状态 ========',
-        '§7实时方式: §f{}   §7布局: §f{}   §7侧边栏: {}'.format(
-            cfg('realtime_mode'), effective_layout(), '§a显示中' if _side_visible else '§c已隐藏'),
+        '§7实时方式: §f{}   §7当前榜: §f{}   §7侧边栏: {}'.format(
+            cfg('realtime_mode'), _board_spec(_active_board())['title'], '§a显示中' if _side_visible else '§c已隐藏'),
         '§7统计目录: §f{}'.format(stats_dir()),
         '§7已识别玩家: §f{}   §7已排除 bot_: §f{}   §7在线: §f{}'.format(
             n_uuid, n_uuid - n_states, n_online),
@@ -1785,10 +1889,10 @@ def _print_status(src: CommandSource):
             cfg('save_all_interval_seconds'),
             '' if cfg('save_all_interval_seconds') else ' §8(关闭：数据只能等原版自动保存，约 5 分钟)'),
     ]
-    lines.append('§6---- {} ----'.format(cfg('break_title')))
-    lines.extend(_status_rows(brk))
-    lines.append('§6---- {} ----'.format(cfg('place_title')))
-    lines.extend(_status_rows(plc))
+    for spec in _board_specs():
+        rows = {BOARD_BREAK: brk, BOARD_PLACE: plc, BOARD_TOTAL: tot}[spec['id']]
+        lines.append('§6---- {} ----'.format(spec['title']))
+        lines.extend(_status_rows(rows[:max(0, int(cfg('board_top_n')))]))
     for line in lines:
         _reply(src, line)
 
@@ -1840,14 +1944,18 @@ def _print_debug(src: CommandSource):
 
 HELP_LINES = [
     '§6======== 简单放置破坏榜 ========',
-    '§7侧边栏同时显示：§e破坏总和榜§7（sum minecraft:mined）§7+ §e放置总和榜§7（各自 used ∩ mined）',
+    '§7三个榜分开显示，自由切换（格式均为：全服总和 + 排行榜，名字左对齐/数值右对齐）：',
+    '§7!!spms §fbreak §7- 破坏总和榜（sum minecraft:mined）',
+    '§7!!spms §fplace §7- 放置总和榜（各自 used ∩ mined）',
+    '§7!!spms §ftotal §7- 总榜（破坏 + 放置）',
+    '§7!!spms §fhide §7- 统一隐藏侧边栏（不删分数）',
+    '§7!!spms §fshow §7- 重新显示当前榜',
     '§7!!spms §fstatus §7- 查看榜单与运行状态',
     '§7!!spms §fdebug §7- 诊断路径 / 文件数 / RCON / 每个玩家的口径',
     '§7!!spms §fdp §7- 数据包模式诊断（模式、pack_format、RCON、生成的文件）',
     '§7!!spms §fdp rebuild §7- 重建实时数据包（保留已累计分数）',
-    '§7!!spms §fshow §7- 显示侧边栏        §7!!spms §fhide §7- 隐藏侧边栏（不删分数）',
     '§7!!spms §frefresh §7- 立即重画（实时模式由服务端自动更新）',
-    '§8需要权限等级 2 才能 show/hide/refresh/dp rebuild。',
+    '§8需要权限等级 2 才能 break/place/total/show/hide/refresh/dp rebuild。',
 ]
 
 
@@ -1881,6 +1989,49 @@ def _cmd_dp(src: CommandSource, rebuild: bool = False):
         _reply(src, line)
 
 
+def _apply_board(board_id: str):
+    """把当前榜切到 board_id：写 #board、setdisplay、强制整榜重画，并记住到配置。"""
+    global _side_visible
+    spec = _board_spec(board_id)
+    _config['active_board'] = spec['id']
+    try:
+        save_config(server)
+    except Exception:
+        pass
+    # 「打开」即显示：切榜时顺带把侧边栏放出来
+    _set_visible(True)
+    if _dp_mode():
+        server.execute('scoreboard players set #board dsb_ctl {}'.format(spec['index']))
+        server.execute('scoreboard players set #visible dsb_ctl 1')
+        server.execute('scoreboard objectives setdisplay sidebar {}'.format(spec['display']))
+        # 清掉本榜占位行的旧分数，render 会把当前前 N 名整榜重写
+        for holder in _board_holders(spec['prefix'], MAX_BOARD_ROWS):
+            server.execute('scoreboard players reset {} {}'.format(holder, spec['display']))
+        server.execute('function {}:render'.format(DP_NAME))
+    else:
+        # poll 模式：删旧建新展示项（顺带清掉另一个榜的占位行）再重画
+        _clear_render_cache()
+        setup_objectives()
+        render(force=True)
+
+
+def _cmd_switch_board(src: CommandSource, board_id: str):
+    spec = _board_spec(board_id)
+    if not _obj_ready:
+        # 计分项还没建（auto_show=false，或服务端刚起来还没补建）。
+        # start_boards() 在 datapack 模式下会等 save-all，不能占着执行器线程。
+        def _start_then_switch():
+            try:
+                _start_boards_once()
+            finally:
+                _apply_board(board_id)
+        _run_async(_start_then_switch, '建立榜单并切换')
+        _reply(src, '§a正在建立榜单并切换到{}，稍后看状态'.format(spec['title']))
+        return
+    _apply_board(board_id)
+    _reply(src, '§a已切换到{}（!!spms hide 隐藏，break/place/total 自由切换）'.format(spec['title']))
+
+
 def _cmd_show(src: CommandSource):
     if not _obj_ready:
         # 计分项还没建（auto_show=false，或服务端刚起来还没补建）。
@@ -1891,12 +2042,12 @@ def _cmd_show(src: CommandSource):
     show_sidebar()
     tick_once(force=True)
     render(force=True)
-    _reply(src, '§a侧边栏已显示')
+    _reply(src, '§a侧边栏已显示（当前：{}）'.format(_board_spec(_active_board())['title']))
 
 
 def _cmd_hide(src: CommandSource):
     hide_sidebar()
-    _reply(src, '§a侧边栏已隐藏（计分项和分数都保留）')
+    _reply(src, '§a侧边栏已隐藏（计分项和分数都保留；break/place/total 随时打开）')
 
 
 def _cmd_refresh(src: CommandSource):
@@ -1914,6 +2065,9 @@ def register_commands(si: PluginServerInterface):
         then(Literal('dp').
              runs(lambda src: _cmd_dp(src)).
              then(Literal('rebuild').requires(_need_perm).runs(lambda src: _cmd_dp(src, True)))).
+        then(Literal('break').requires(_need_perm).runs(lambda src: _cmd_switch_board(src, BOARD_BREAK))).
+        then(Literal('place').requires(_need_perm).runs(lambda src: _cmd_switch_board(src, BOARD_PLACE))).
+        then(Literal('total').requires(_need_perm).runs(lambda src: _cmd_switch_board(src, BOARD_TOTAL))).
         then(Literal('show').requires(_need_perm).runs(lambda src: _cmd_show(src))).
         then(Literal('hide').requires(_need_perm).runs(lambda src: _cmd_hide(src))).
         then(Literal('refresh').requires(_need_perm).runs(lambda src: _cmd_refresh(src)))
@@ -1944,9 +2098,9 @@ def on_load(si: PluginServerInterface, old_module):
     dp_load_index()
     refresh_uuid_list(si)
     register_commands(si)
-    si.register_help_message('!!spms', '简单放置破坏榜：破坏/放置总和双榜')
+    si.register_help_message('!!spms', '简单放置破坏榜：破坏/放置/总榜，!!spms break|place|total 切换')
     _ensure_tick_thread()
-    si.logger.info('[spms] 命令已注册：!!spms status / debug / dp / show / hide / refresh')
+    si.logger.info('[spms] 命令已注册：!!spms break / place / total / show / hide / status / debug / dp / refresh')
 
     # 只有「慢活」丢到后台线程：datapack 模式要 save-all 并等一会儿才回填，
     # 而 on_load 跑在 MCDR 的任务执行器线程上，在那里阻塞会死锁（参考插件也踩过这个坑）。
@@ -2020,8 +2174,8 @@ def on_unload(si: PluginServerInterface):
                 for tag in ('load', 'tick'):
                     dp_write_tag(tag + '.json', json.dumps({'values': []}) + '\n')
             else:
-                for obj in (OBJ_STACKED, OBJ_BREAK, OBJ_PLACE):
-                    si.execute('scoreboard objectives remove {}'.format(obj))
+                # poll 模式的展示计分项（dsb_brd）连同占位行一起删掉
+                si.execute('scoreboard objectives remove {}'.format(OBJ_BOARD))
         except Exception as e:
             si.logger.error('[spms] 停止数据包失败: {}'.format(e))
 
