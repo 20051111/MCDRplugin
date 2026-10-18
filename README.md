@@ -4,7 +4,7 @@ TPW 的 MCDReforged 插件 / 资源仓库。
 
 | 目录 | 内容 |
 |---|---|
-| [`plugins/`](plugins/) | MCDReforged 插件（当前：[简单放置破坏榜](#简单放置破坏榜-simpleplacedminedscoreboard)） |
+| [`plugins/`](plugins/) | MCDReforged 插件（当前：[简单放置破坏榜](#简单放置破坏榜-simpleplacedminedscoreboard)、[仓库审计日志](#仓库审计日志-warehouseauditlog)） |
 | [`材质包/`](材质包/) | 服务器材质包相关文件 |
 
 ---
@@ -131,3 +131,49 @@ MCDReforged 单文件插件：在 Minecraft 服务端侧边栏（sidebar）实�
 ## 致谢
 
 玩家名/UUID 映射与统计读取逻辑参考 StatsHelper 的实现。
+
+---
+
+# 仓库审计日志 (WarehouseAuditLog)
+
+MCDReforged 单文件插件：监控指定坐标范围内**仓库容器（箱子/陷阱箱/木桶/17 种潜影盒）的取出行为**，
+记录到 SQLite 并以 CSV 导出，全程只读 RCON 轮询 + 异步队列写入，**不卡服**。
+
+- 插件 id：`warehouse_audit`
+- 命令：`!!wh`（`!!wh help` 查看全部）
+- 依赖：MCDReforged ≥ 2.1.0，Minecraft 1.13~1.20.4 实测（1.20.5+ 自适应），需启用 RCON
+- 当前版本：**v1.0.0**
+- 源码与详细文档：[20051111/mcdr-warehouse-audit](https://github.com/20051111/mcdr-warehouse-audit)
+
+## 功能特性
+
+- **只记取出**：默认存入不记录、不记玩家 ID、不记维度、不记槽位（均可配置）
+- **自动合并**：1 秒内同容器同物品的多次取出合并为一条、数量相加
+- **内容物读取**：取出潜影盒/箱子物品时读取其内嵌 NBT，如 `packed_ice x640; chest x64`
+- **容器自动发现**：区域 ≤2 万方块用 RCON 扫描，超出回退区域文件解析
+- **数据安全**：服务端崩溃/关闭时合并缓冲立即写出、恢复后重新基线（回档不产生幽灵记录）；
+  优雅退出排空队列，强杀最多丢约 0.5 秒未写记录
+
+## 常用命令
+
+| 命令 | 权限 | 说明 |
+| --- | --- | --- |
+| `!!wh recent [N]` | 所有人 | 查看最近 N 条记录（默认 10，最新在上） |
+| `!!wh status` / `list` | 所有人 | 运行状态 / 已知容器列表 |
+| `!!wh export [选项]` | helper+ | 导出 CSV（带统计时间跨度、服务端版本备注行） |
+| `!!wh region set <名称> <维度> <x1> <y1> <z1> <x2> <y2> <z2>` | helper+ | 游戏内配置监控范围，立即生效 |
+| `!!wh rescan` / `on` / `off` | helper+ | 重新枚举 / 恢复 / 暂停轮询 |
+
+CSV 默认列：`时间, X, Y, Z, 容器类型, 物品ID, 变化量, 变化前, 变化后, 方向, 内容物`
+
+## 安装
+
+1. 把 `plugins/warehouse_audit-1.0.0.py` 放进 MCDR 的 `plugins/` 目录；
+2. 确保服务端 RCON 已启用（`config.yml` 中 `rcon.enable: true`）；
+3. 重启 MCDR 或等 AutoPluginReloader 自动重载；
+4. 用 `!!wh region set ...` 配置区域（或编辑 `config/warehouse_audit/warehouse_audit.json`）。
+
+## 版本历史
+
+- **v1.0.0**：首个版本。只记取出/不记玩家ID/不记维度/不记槽位；1 秒合并；
+  内容物读取；区域指令；崩溃/回档数据安全；92 项单元测试。
