@@ -882,7 +882,6 @@ class WarehouseAudit:
 			players = dict(self.players)
 			old_snapshots = dict(self.snapshots)
 			region_of = dict(self.region_of)
-		new_snapshots: Dict[Tuple[int, int, int], Dict[int, Tuple[str, int]]] = {}
 		records: List[Tuple] = []
 		prune_threshold = int(self.config.get('prune_after_misses', 600))
 		# 多线程解析: RCON 拉取串行 (单 socket), SNBT 解析并行 (CPU 密集)
@@ -930,6 +929,11 @@ class WarehouseAudit:
 				items_list[:max(0, start + batch_limit - len(items_list))]
 		else:
 			batch = items_list
+		# 轮转分批: 未本批查询的容器必须保留旧快照!
+		# (否则快照被清空 -> 下次轮到该容器时 old=None -> 被当成首次读取建基线 -> 永远不记录!)
+		batch_positions = set(pos for pos, _ in batch)
+		new_snapshots = {pos: snap for pos, snap in old_snapshots.items()
+						 if pos not in batch_positions}
 		# 拉取+解析在多个工作线程并行 (RCON 内部有锁串行化, 解析并行)
 		from concurrent.futures import ThreadPoolExecutor
 		workers = max(2, min(4, (os.cpu_count() or 2)))
