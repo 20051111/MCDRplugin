@@ -692,6 +692,9 @@ class WarehouseAudit:
 		# 响应哈希缓存 (1.20.5+ 大响应性能优化: 哈希未变跳过解析)
 		self._resp_hashes: Dict[Tuple[int, int, int], int] = {}
 		self._resp_hash_lock = threading.Lock()
+		# 轮转分批游标 (大仓库保护: 每周期只查一批)
+		self._poll_batch_cursor = 0
+		self._poll_batch_lock = threading.Lock()
 		# 容器列表锁定 (lock_containers=true 时首次枚举后密封)
 		self._containers_sealed = False
 		# 匿名编号映射: player name -> 编号 (anon mode)
@@ -724,6 +727,8 @@ class WarehouseAudit:
 
 		# 区域文件解析缓存: path -> (mtime, size, {(cx,cz): root})
 		self._region_file_cache: Dict[str, Tuple[float, int, Dict[Tuple[int, int], Dict[str, Any]]]] = {}
+		# 注意: v1.0.5 起缓存结构改为 (mtime, size, entities, other_positions)
+		# 只缓存容器实体与非容器坐标, 不缓存整个 chunk NBT (内存泄漏修复)
 
 	# ------------------------------------------------------------------ 配置
 
@@ -912,19 +917,35 @@ class WarehouseAudit:
 			with parse_lock:
 				parse_results[pos] = (status, items)
 
+		# 轮转分批 (大仓库保护): 容器数超过单批上限时, 每周期只查一批,
+		# 轮转覆盖全部 —— 每批 60 个容器 x ~40ms = 2.4s, TPS 不至于垮
+		# (1832 容器 = 每 31 个周期轮完一遍, 检测延迟最多 ~5 分钟)
+		batch_limit = int(self.config.get('poll_batch_size', 60))
+		items_list = list(containers.items())
+		if len(items_list) > batch_limit:
+			with self._poll_batch_lock:
+				start = self._poll_batch_cursor % len(items_list)
+				self._poll_batch_cursor = (start + batch_limit) % len(items_list)
+			batch = items_list[start:start + batch_limit] + \
+				items_list[:max(0, start + batch_limit - len(items_list))]
+		else:
+			batch = items_list
 		# 拉取+解析在多个工作线程并行 (RCON 内部有锁串行化, 解析并行)
 		from concurrent.futures import ThreadPoolExecutor
 		workers = max(2, min(4, (os.cpu_count() or 2)))
 		with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='WarehouseAudit-Parse') as pool:
-			futures = [pool.submit(fetch_and_parse, pos, bid) for pos, bid in containers.items()]
+			futures = [pool.submit(fetch_and_parse, pos, bid) for pos, bid in batch]
 			for f in futures:
 				f.result()
 		if parse_error['abort']:
 			# RCON 断开: 本轮中止 (快照不变, 下轮重新基线)
 			return
-		for pos, block_id in containers.items():
+		for pos, block_id in batch:
 			result = parse_results.get(pos)
 			if result is None:
+				# 本批未查到的容器 (轮转分批模式): 保留旧快照与 miss 计数
+				if pos in old_snapshots:
+					new_snapshots[pos] = old_snapshots[pos]
 				continue
 			status, items = result
 			if status == 'unchanged':
@@ -1499,31 +1520,19 @@ class WarehouseAudit:
 					path = os.path.join(region_dir, 'r.{}.{}.mca'.format(rx, rz))
 					if not os.path.isfile(path):
 						continue
-					for chunk_x, chunk_z, root in self._iter_region_file_cached(path):
-						if not (cx1 <= chunk_x <= cx2 and cz1 <= chunk_z <= cz2):
-							continue
-						# 方块实体: 1.13~1.20.x 在区块根节点; 同时兼容存放在 sections 内的格式
-						be_lists = [root.get('block_entities') or []]
-						for section in root.get('sections') or []:
-							if isinstance(section, dict) and section.get('block_entities'):
-								be_lists.append(section['block_entities'])
-						for be_list in be_lists:
-							for be in be_list:
-								if not isinstance(be, dict):
-									continue
-								block_id = be.get('id')
-								if not isinstance(block_id, str) or block_id not in container_ids:
-									continue
-								try:
-									bx, by, bz = int(be['x']), int(be['y']), int(be['z'])
-								except (KeyError, TypeError, ValueError):
-									continue
-								if lo[0] <= bx <= hi[0] and lo[1] <= by <= hi[1] and lo[2] <= bz <= hi[2]:
-									found[(bx, by, bz)] = block_id
+					# 内存优化: 生成器只产出容器实体 (缓存不含 chunk NBT root)
+					for bx, by, bz, block_id in self._iter_region_file_cached(path, container_ids, (lo, hi)):
+						if lo[0] <= bx <= hi[0] and lo[1] <= by <= hi[1] and lo[2] <= bz <= hi[2]:
+							found[(bx, by, bz)] = block_id
 		return found
 
-	def _iter_region_file_cached(self, path: str):
-		"""带 (mtime,size) 缓存的区域文件遍历。"""
+	def _iter_region_file_cached(self, path: str, container_ids: Optional[Set[str]] = None,
+								bounds: Optional[Tuple[Tuple[int, int, int], Tuple[int, int, int]]] = None):
+		"""带 (mtime,size) 缓存的区域文件遍历。
+
+		内存优化: 只缓存**容器方块实体** (id/坐标), 不缓存整个 chunk NBT root
+		(大区域全部 chunk root 可达数百 MB 内存泄漏)。非容器方块实体只存坐标。
+		"""
 		try:
 			st = os.stat(path)
 			sig = (st.st_mtime, st.st_size)
@@ -1531,19 +1540,40 @@ class WarehouseAudit:
 			return
 		cached = self._region_file_cache.get(path)
 		if cached is not None and cached[0] == sig[0] and cached[1] == sig[1]:
-			results = cached[2]
+			entities = cached[2]
 		else:
-			results = {}
+			entities: Dict[Tuple[int, int, int], str] = {}
+			other_positions: Set[Tuple[int, int, int]] = set()
 			try:
 				for chunk_x, chunk_z, root in iter_region_file_chunks(path):
-					results[(chunk_x, chunk_z)] = root
+					# 方块实体: 1.13~1.20.x 在区块根节点; 兼容 sections 内的格式
+					be_lists = [root.get('block_entities') or []]
+					for section in root.get('sections') or []:
+						if isinstance(section, dict) and section.get('block_entities'):
+							be_lists.append(section['block_entities'])
+					for be_list in be_lists:
+						for be in be_list:
+							if not isinstance(be, dict):
+								continue
+							try:
+								bx, by, bz = int(be['x']), int(be['y']), int(be['z'])
+							except (KeyError, TypeError, ValueError):
+								continue
+							block_id = be.get('id')
+							if isinstance(block_id, str) and block_id in (container_ids or set()):
+								entities[(bx, by, bz)] = block_id
+							elif bounds is None or (bounds[0][0] <= bx <= bounds[1][0]
+									and bounds[0][1] <= by <= bounds[1][1]
+									and bounds[0][2] <= bz <= bounds[1][2]):
+								# 非容器只记坐标 (verified_absent 用), 不存整个 NBT
+								other_positions.add((bx, by, bz))
 			except OSError as e:
 				self.server.logger.warning(
 					'WarehouseAudit: cannot read region file {}: {}'.format(path, e))
 				return
-			self._region_file_cache[path] = (sig[0], sig[1], results)
-		for (chunk_x, chunk_z), root in results.items():
-			yield chunk_x, chunk_z, root
+			self._region_file_cache[path] = (sig[0], sig[1], entities, other_positions)
+		for (bx, by, bz), block_id in entities.items():
+			yield bx, by, bz, block_id
 
 	# ------------------------------------------------------------------ 导出
 
@@ -1562,8 +1592,20 @@ class WarehouseAudit:
 		out_path = options['out'] or os.path.join(
 			self.export_dir,
 			'warehouse_audit_{}.csv'.format(datetime.datetime.now().strftime('%Y%m%d_%H%M%S')))
+		# 安全: --out 路径校验 (防任意路径写入)
+		# 允许: 导出目录内, 或工作目录内; 拒绝相对路径穿越与其他盘符/系统目录
+		if options['out']:
+			_check = os.path.abspath(out_path)
+			_allowed = os.path.abspath(self.export_dir)
+			_workdir = os.path.abspath(self.server.get_mcdr_config().get('working_directory', '.') or '.')
+			if not (_check.startswith(_allowed + os.sep) or _check == _allowed
+					or _check.startswith(_workdir + os.sep)):
+				source.reply('§c--out 路径不允许: {}§r'.format(out_path))
+				source.reply('§7只允许写入导出目录 ({}) 或服务端工作目录内§r'.format(self.export_dir))
+				return
 		try:
-			count = self._write_csv(options, out_path)
+			result = self._write_csv(options, out_path)
+			count, span_from, span_to = result
 		except Exception as e:
 			self.server.logger.error('WarehouseAudit export failed:\n{}'.format(traceback.format_exc()))
 			source.reply('§c导出失败: {}§r'.format(e))
